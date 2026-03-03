@@ -279,7 +279,7 @@ RE_CONFIG = re.compile(r'dim=(\d+) hidden=(\d+) heads=(\d+) seq=(\d+) vocab=(\d+
 RE_PARAMS = re.compile(r'Params: ([\d.]+)M \(transformer ([\d.]+)M \+ embed ([\d.]+)M\)')
 RE_KERNELS = re.compile(r'Kernels: (\d+).*?(\d+) weight-bearing')
 RE_ACCUM = re.compile(r'Accum (\d+).*LR=([\d.e+-]+)')
-RE_STEP = re.compile(r'step\s+(\d+)\s+loss=([\d.]+)')
+RE_STEP = re.compile(r'step\s+(\d+)\s+loss=([\d.]+)(?:\s+lr=([\d.e+-]+))?(?:\s+([\d.]+)ms/step)?')
 RE_BATCH = re.compile(r'\[batch (\d+): compile=([\d.]+)ms train=([\d.]+)ms \(([\d.]+)ms/step\) compiles=(\d+)\]')
 RE_TIMING = re.compile(r'ane=([\d.]+) io=([\d.]+) cls=([\d.]+) elem=([\d.]+) rms=([\d.]+) cblas_wait=([\d.]+)')
 RE_RESTART = re.compile(r'\[exec\(\) restart step (\d+)')
@@ -323,6 +323,10 @@ def parse_line(line):
     m = RE_STEP.search(line)
     if m:
         S.step, S.loss = int(m[1]), float(m[2])
+        if m[3]:
+            S.training['lr'] = m[3]
+        if m[4]:
+            S.ms_per_step = float(m[4])
         S.loss_history.append((S.step, S.loss))
         S.best_loss = min(S.best_loss, S.loss)
         return
@@ -659,10 +663,19 @@ def set_nonblock(fd):
     fl = fcntl.fcntl(fd, fcntl.F_GETFL)
     fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
 
-def spawn_training(resume=False, steps=10000):
-    cmd = 'make train_large 2>&1 && ./train_large'
+def spawn_training(resume=False, steps=10000, dynamic=False, scratch=False, lr=None, accum=None):
+    if dynamic:
+        cmd = 'cd training_dynamic && make 2>&1 && ./train'
+    else:
+        cmd = 'make train_large 2>&1 && ./train_large'
     if resume:
         cmd += ' --resume'
+    if scratch and dynamic:
+        cmd += ' --scratch'
+    if lr is not None:
+        cmd += f' --lr {lr}'
+    if accum is not None:
+        cmd += f' --accum {accum}'
     cmd += f' --steps {steps}'
     proc = subprocess.Popen(
         ['bash', '-c', cmd],
@@ -684,6 +697,10 @@ def spawn_powermetrics():
 def main():
     parser = argparse.ArgumentParser(description='ANE Training Dashboard (stories110M)')
     parser.add_argument('--resume', action='store_true', help='Resume from checkpoint')
+    parser.add_argument('--dynamic', action='store_true', help='Use v2 dynamic weight pipeline (training_dynamic/)')
+    parser.add_argument('--scratch', action='store_true', help='Train from scratch (random init)')
+    parser.add_argument('--lr', type=float, default=None, help='Learning rate')
+    parser.add_argument('--accum', type=int, default=None, help='Gradient accumulation steps')
     parser.add_argument('--infinite', action='store_true', help='Train indefinitely')
     parser.add_argument('--no-powermetrics', action='store_true')
     parser.add_argument('--no-generate', action='store_true', help='Disable text generation')
@@ -697,7 +714,8 @@ def main():
     term = Terminal()
     procs = []
 
-    train_proc = spawn_training(resume=args.resume, steps=args.steps)
+    train_proc = spawn_training(resume=args.resume, steps=args.steps, dynamic=args.dynamic,
+                                scratch=args.scratch, lr=args.lr, accum=args.accum)
     S.train_pid = train_proc.pid
     procs.append(train_proc)
 
@@ -837,7 +855,8 @@ def main():
                         if train_proc:
                             train_proc.terminate()
                             train_proc.wait()
-                        train_proc = spawn_training(resume=True, steps=args.steps)
+                        train_proc = spawn_training(resume=True, steps=args.steps, dynamic=args.dynamic,
+                                                        lr=args.lr, accum=args.accum)
                         S.train_pid = train_proc.pid
                         procs = [p for p in procs if p.poll() is None]
                         procs.append(train_proc)

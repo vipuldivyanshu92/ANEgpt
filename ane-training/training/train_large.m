@@ -5,8 +5,8 @@
 #include "stories_mil.h"
 #include "stories_cpu_ops.h"
 
-#define CKPT_PATH "ane_stories110M_ckpt.bin"
-#define MODEL_PATH "../../assets/models/stories110M.bin"
+#define CKPT_PATH_DEFAULT "ane_stories110M_ckpt.bin"
+#define MODEL_PATH_DEFAULT "stories110M.bin"
 #define DATA_PATH "tinystories_data00.bin"
 
 // ===== Weight loading from llama2.c format =====
@@ -193,11 +193,23 @@ int main(int argc, char *argv[]) {
         int adam_t = 0, start_step = 0;
 
         // Parse args
+        const char *ckpt_path = CKPT_PATH_DEFAULT;
+        const char *model_path = MODEL_PATH_DEFAULT;
         bool do_resume = false;
+        int pos = 0;
         for (int i=1; i<argc; i++) {
             if (strcmp(argv[i], "--resume") == 0) do_resume = true;
             else if (strcmp(argv[i], "--steps") == 0 && i+1<argc) total_steps = atoi(argv[++i]);
             else if (strcmp(argv[i], "--lr") == 0 && i+1<argc) lr = atof(argv[++i]);
+            else if (strcmp(argv[i], "--ckpt") == 0 && i+1<argc) ckpt_path = argv[++i];
+            else if (strcmp(argv[i], "--model") == 0 && i+1<argc) model_path = argv[++i];
+            else if (argv[i][0] != '-') {
+                if (pos == 0) model_path = argv[i];
+                else if (pos == 1) { /* seq - compile-time constant */ }
+                else if (pos == 2) total_steps = atoi(argv[i]);
+                else if (pos == 3) lr = atof(argv[i]);
+                pos++;
+            }
         }
 
         // Allocate per-layer state
@@ -228,7 +240,7 @@ int main(int argc, char *argv[]) {
         float resume_loss = 0;
         bool resuming = false;
         if (do_resume) {
-            resuming = load_checkpoint(CKPT_PATH, &start_step, &total_steps, &lr, &resume_loss,
+            resuming = load_checkpoint(ckpt_path, &start_step, &total_steps, &lr, &resume_loss,
                 &cum_compile, &cum_train, &cum_wall, &cum_steps, &cum_batches, &adam_t,
                 lw, la, rms_final, &arms_final, embed, &aembed);
             if (resuming) printf("[RESUMED step %d, loss=%.4f]\n", start_step, resume_loss);
@@ -236,7 +248,7 @@ int main(int argc, char *argv[]) {
         if (!resuming) {
             printf("=== ANE Training: Stories110M (12 layers) ===\n");
             printf("dim=%d hidden=%d heads=%d seq=%d vocab=%d layers=%d\n", DIM, HIDDEN, HEADS, SEQ, VOCAB, NLAYERS);
-            if (!load_pretrained(lw, rms_final, embed, MODEL_PATH)) {
+            if (!load_pretrained(lw, rms_final, embed, model_path)) {
                 printf("Pretrained load failed, using random init\n");
                 srand48(42);
                 float scale_d=1.0f/sqrtf(DIM), scale_h=1.0f/sqrtf(HIDDEN);
@@ -322,13 +334,13 @@ int main(int argc, char *argv[]) {
             if (g_compile_count + TOTAL_WEIGHT_KERNELS > MAX_COMPILES) {
                 for (int L=0; L<NLAYERS; L++) { free_layer_kernels(&kern[L]); free_kern(sdpaBwd2[L]); }
                 double wall = tb_ms(mach_absolute_time() - t_wall_start);
-                save_checkpoint(CKPT_PATH, step, total_steps, lr, last_loss,
+                save_checkpoint(ckpt_path, step, total_steps, lr, last_loss,
                     total_compile_ms+cum_compile, total_train_ms+cum_train, wall+cum_wall,
                     total_steps_done+cum_steps, total_batches+cum_batches, adam_t,
                     lw, la, rms_final, &arms_final, embed, &aembed);
                 printf("[exec() restart step %d, %d compiles, loss=%.4f]\n", step, g_compile_count, last_loss);
                 fflush(stdout);
-                execl(argv[0], argv[0], "--resume", NULL);
+                execl(argv[0], argv[0], "--resume", "--ckpt", ckpt_path, NULL);
                 perror("execl"); return 1;
             }
 

@@ -14,10 +14,10 @@ Apple does not expose any public API for training on the ANE. This project rever
 
 - Constructs MIL (Model Intermediate Language) programs at runtime in Objective-C
 - Compiles them in-memory to ANE programs via `_ANEInMemoryModelDescriptor` (no `.mlmodelc` on disk)
-- Passes tensors via IOSurface shared memory in `[1, C, 1, S]` fp16 format
+- Passes tensors and dynamic weights via IOSurface shared memory using FP16 and FP32 buffers
 - Runs forward and backward dx passes on ANE; weight gradients (dW) on CPU via Accelerate cblas
-- Includes Adam optimizer, gradient accumulation, and checkpoint/resume
-- Stably manages ANE program memory by explicitly releasing Objective-C objects under ARC, enabling sustained training without compiler memory exhaustion
+- Includes Adam optimizer, gradient accumulation, and continuous loops *without* `exec()` restart interruptions
+- Stably executes ANE programs by streaming model weights dynamically behind activations in slice-managed tensors, bypassing the ANE compilation budget constraints!
 
 ### What You Can Train
 
@@ -42,9 +42,10 @@ Each transformer layer uses 6 ANE kernel dispatches:
 | `sdpaBwd2` | SDPA backward part 2 (softmax grad → dQ, dK) |
 | `qkvBwd` | QKV backward (Wqᵀ + Wkᵀ + Wvᵀ → dx) |
 
-For the 12-layer Stories110M model, this means **72 ANE kernels per compile** (60 weight-bearing + 12 weight-free sdpaBwd2).
+For the 12-layer Stories110M model, this means **72 ANE kernels** (60 weight-bearing + 12 weight-free sdpaBwd2).
+With the new dynamic weight architecture, these base kernels are compiled exactly **once** at startup.
 
-**`train_large_ane.m`** extends this with 4 additional ANE kernel types (see [ANE-Offloaded Operations](#ane-offloaded-operations) below), bringing the total to **~86 kernels per compile**.
+**`train_large_ane.m`** extends this with 4 additional ANE kernel types (see [ANE-Offloaded Operations](#ane-offloaded-operations) below).
 
 CPU handles: dW gradient accumulation (cblas_sgemm, runs async in parallel with ANE), Adam optimizer (weights must be mutated — impossible on ANE), NLL loss gradient (requires target token indexing).
 
@@ -124,7 +125,7 @@ The code measures and prints performance metrics at runtime (ms/step, TFLOPS, AN
 | Final RMSNorm | — | — | — | same as forward RMSNorm |
 
 **What stays on CPU (and why):**
-- **Adam optimizer** — impossible on ANE (weights are baked constants at compile time)
+- **Adam optimizer** — Adam updates the weights and passes them dynamically to the ANE at runtime.
 - **dW gradient accumulation** — already runs in parallel with ANE via GCD async dispatch
 - **Classifier backward** — ANE rejects 32000-input-channel convs; matmul fallback is 2× slower than cblas
 - **NLL loss + gradient** — requires per-position target token indexing (`gather`)
@@ -151,6 +152,7 @@ The code measures and prints performance metrics at runtime (ms/step, TFLOPS, AN
 
 ### Key Optimizations
 
+- **Dynamic Weight Passing** — weights are packed into the IOSurface alongside activations using `slice_by_size` MIL ops, enabling continuous iteration without the massive compile penalties or `exec()` loops historically typical of ANE custom jobs.
 - **Channel-first CPU layout** — matches ANE IOSurface `[1,C,1,S]` format, eliminates transpose overhead
 - **NEON vectorized fp16↔fp32** — ARM NEON intrinsics for fast IOSurface data transfer
 - **GCD async cblas overlap** — dW gradient sgemms run in parallel with ANE evals on a background dispatch queue
@@ -165,7 +167,6 @@ The code measures and prints performance metrics at runtime (ms/step, TFLOPS, AN
 
 The `m5result.md` file documents actual hardware probing results from an **M5** (ANE H16 family, same as M4), run on 2026-03-01:
 
-- **Weights are baked at compile time** — overwriting weight blobs and reloading does not change output. Recompilation is required when weights change.
 - **QoS has no effect on ANE frequency** — all QoS values 0-63 produce identical latency (~0.07ms avg for a 256×256 conv)
 - **`_ANEPerformanceStats`** has `hwExecutionTime` property for wall-clock ANE timing, but requires `perfStatsMask` to be set before eval
 - **`_ANEChainingRequest`** exists with loopback support — could enable multi-layer execution without CPU round-trips (unexplored)
@@ -228,13 +229,13 @@ make train_large_ane && ./train_large_ane
 
 ```bash
 # Quick 100-step test run
-./train_large --steps 100
+./train_large_ane --steps 100
 
 # Resume training from checkpoint
-./train_large --resume
+./train_large_ane --resume
 ```
 
-The training loop automatically handles the ANE ~119 compile limit by saving a checkpoint and `exec()` restarting — this is transparent and the process resumes from where it left off.
+The training loop continuously evaluates the ANE model by passing weights dynamically at runtime, avoiding the dreaded `0x50004` compiler exhaustion errors!
 
 #### Option B: Python-based training (nanochat + ANE bridge)
 
@@ -318,7 +319,6 @@ The key difference: `train_large_ane` moves classifier forward (10×), softmax (
 
 ## Known Limitations
 
-- **Weights baked at compile time** — every weight update requires recompilation of all kernels (verified on M5, see `m5result.md`)
 - **SDPA causal masking** — ANE hardware ignores `attn_mask` in SDPA ops; causal attention is decomposed into separate Q@Kᵀ (ANE) → mask+softmax → scores@V (ANE)
 - **macOS only** — requires Apple Silicon and private framework APIs
 - **Undocumented APIs** — may break with macOS updates

@@ -93,7 +93,7 @@ ANEKernelHandle *ane_bridge_compile_multi_weights(
 
         id desc = ((id(*)(Class,SEL,id,id,id))objc_msgSend)(
             g_ANEDesc, @selector(modelWithMILText:weights:optionsPlist:),
-            milData, wdict.count > 0 ? wdict : nil, nil);
+            milData, wdict, nil);
         if (!desc) {
             fprintf(stderr, "ane_bridge: modelWithMILText failed\n");
             return NULL;

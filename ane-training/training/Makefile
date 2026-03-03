@@ -14,7 +14,7 @@ train_large: train_large.m $(HEADERS_LARGE)
 	$(CC) $(CFLAGS) -o $@ train_large.m $(LDFLAGS) -framework Accelerate
 
 train_large_ane: train_large_ane.m $(HEADERS_ANE)
-	$(CC) $(CFLAGS) -o $@ train_large_ane.m $(LDFLAGS) -framework Accelerate
+	$(CC) $(CFLAGS) -I training_dynamic -o $@ train_large_ane.m $(LDFLAGS) -framework Accelerate
 
 PROBES = test_weight_reload test_perf_stats test_qos_sweep test_ane_advanced
 

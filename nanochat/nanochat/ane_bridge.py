@@ -262,7 +262,7 @@ _MIL_HEADER = (
     'program(1.3)\n'
     '[buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, '
     '{"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, '
-    '{"coremltools-version", "9.0"}})]'
+    '{"coremltools-version", "9.0"}})]\n'
 )
 
 
@@ -292,5 +292,59 @@ def generate_conv_mil(in_ch, out_ch, spatial):
         '    } -> (y);\n}\n'
     ) % (in_ch, spatial, in_ch, spatial, out_ch, in_ch, out_ch, in_ch,
          out_ch, spatial, out_ch, spatial)
+
+    return _MIL_HEADER + body
+
+def generate_dyn_matmul_mil(in_ch, out_ch, spatial):
+    """
+    Generate MIL for dynamic matmul: y = W @ x
+    Input x: [1, in_ch, 1, spatial + out_ch] fp32 (activations + transposed weights)
+    Output: [1, out_ch, 1, spatial] fp32
+    """
+    sp = spatial + out_ch
+    body = (
+        '{\n'
+        '    func main<ios18>(tensor<fp32, [1, %d, 1, %d]> x) {\n'
+        '        string d1 = const()[name = string("d1"), val = string("fp16")];\n'
+        '        tensor<fp16, [1, %d, 1, %d]> xh = cast(dtype = d1, x = x)[name = string("cin")];\n'
+        
+        '        tensor<int32, [4]> ba = const()[name=string("ba"), val=tensor<int32, [4]>([0,0,0,0])];\n'
+        '        tensor<int32, [4]> sa = const()[name=string("sa"), val=tensor<int32, [4]>([1,%d,1,%d])];\n'
+        '        tensor<fp16, [1,%d,1,%d]> act = slice_by_size(x=xh,begin=ba,size=sa)[name=string("act")];\n'
+        
+        '        tensor<int32, [4]> bw = const()[name=string("bw"), val=tensor<int32, [4]>([0,0,0,%d])];\n'
+        '        tensor<int32, [4]> sw = const()[name=string("sw"), val=tensor<int32, [4]>([1,%d,1,%d])];\n'
+        '        tensor<fp16, [1,%d,1,%d]> wt = slice_by_size(x=xh,begin=bw,size=sw)[name=string("wt")];\n'
+        
+        '        tensor<int32, [4]> ra = const()[name=string("ra"), val=tensor<int32, [4]>([1,1,%d,%d])];\n'
+        '        tensor<fp16, [1,1,%d,%d]> a2 = reshape(shape=ra,x=act)[name=string("a2")];\n'
+        
+        '        tensor<int32, [4]> pm = const()[name=string("pm"), val=tensor<int32, [4]>([0,1,3,2])];\n'
+        '        tensor<fp16, [1,1,%d,%d]> a3 = transpose(perm=pm,x=a2)[name=string("a3")];\n'
+        
+        '        tensor<int32, [4]> rw = const()[name=string("rw"), val=tensor<int32, [4]>([1,1,%d,%d])];\n'
+        '        tensor<fp16, [1,1,%d,%d]> W = reshape(shape=rw,x=wt)[name=string("W")];\n'
+        
+        '        bool bF = const()[name=string("bF"), val=bool(false)];\n'
+        '        tensor<fp16, [1,1,%d,%d]> yh = matmul(transpose_x=bF,transpose_y=bF,x=a3,y=W)[name=string("yh")];\n'
+        
+        '        tensor<fp16, [1,1,%d,%d]> yt = transpose(perm=pm,x=yh)[name=string("yt")];\n'
+        '        tensor<int32, [4]> ro = const()[name=string("ro"), val=tensor<int32, [4]>([1,%d,1,%d])];\n'
+        '        tensor<fp16, [1,%d,1,%d]> yr = reshape(shape=ro,x=yt)[name=string("yr")];\n'
+        
+        '        string d2 = const()[name = string("d2"), val = string("fp32")];\n'
+        '        tensor<fp32, [1, %d, 1, %d]> y = cast(dtype = d2, x = yr)[name = string("co")];\n'
+        '    } -> (y);\n}\n'
+    ) % (in_ch, sp, 
+         in_ch, sp, 
+         in_ch, spatial, in_ch, spatial,
+         spatial, in_ch, out_ch, in_ch, out_ch,
+         in_ch, spatial, in_ch, spatial,
+         spatial, in_ch,
+         in_ch, out_ch, in_ch, out_ch,
+         spatial, out_ch,
+         out_ch, spatial,
+         out_ch, spatial, out_ch, spatial,
+         out_ch, spatial)
 
     return _MIL_HEADER + body
