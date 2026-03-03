@@ -26,6 +26,8 @@ import argparse
 import numpy as np
 from pathlib import Path
 
+CKPT_PATH = os.path.join(os.environ.get('NANOCHAT_BASE_DIR', os.path.expanduser('~/.cache/nanochat')), 'ane_ckpt.npz')
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from nanochat.ane_bridge import ANEBridge, ANEKernel, generate_conv_mil
 
@@ -109,6 +111,68 @@ class ANEGPTTrainer:
             w = self._get_weight(name)
             self.adam_m[name] = np.zeros_like(w)
             self.adam_v[name] = np.zeros_like(w)
+
+        # Cumulative stats (persisted across restarts)
+        self.cum_steps = 0
+        self.cum_compile_ms = 0.0
+        self.cum_train_ms = 0.0
+        self.cum_wall = 0.0
+        self.last_loss = float('inf')
+        self.initial_loss = None
+
+    def save_checkpoint(self, path, batch_idx, total_batches, all_losses):
+        """Save full trainer state for exec() restart."""
+        d = {
+            'batch_idx': np.array(batch_idx),
+            'total_batches': np.array(total_batches),
+            'adam_t': np.array(self.adam_t),
+            'cum_steps': np.array(self.cum_steps),
+            'cum_compile_ms': np.array(self.cum_compile_ms),
+            'cum_train_ms': np.array(self.cum_train_ms),
+            'cum_wall': np.array(self.cum_wall),
+            'last_loss': np.array(self.last_loss),
+            'embed': self.embed,
+            'rms_final': self.rms_final,
+        }
+        if self.initial_loss is not None:
+            d['initial_loss'] = np.array(self.initial_loss)
+        if all_losses:
+            d['all_losses'] = np.array(all_losses)
+        for i in range(self.depth):
+            for k, v in self.layers[i].items():
+                d[f'layer{i}.{k}'] = v
+        for name in self._weight_names():
+            d[f'adam_m.{name}'] = self.adam_m[name]
+            d[f'adam_v.{name}'] = self.adam_v[name]
+        np.savez(path, **d)
+
+    def load_checkpoint(self, path):
+        """Load trainer state from checkpoint. Returns (batch_idx, total_batches, all_losses)."""
+        d = np.load(path, allow_pickle=False)
+        self.adam_t = int(d['adam_t'])
+        self.cum_steps = int(d['cum_steps'])
+        self.cum_compile_ms = float(d['cum_compile_ms'])
+        self.cum_train_ms = float(d['cum_train_ms'])
+        self.cum_wall = float(d['cum_wall'])
+        self.last_loss = float(d['last_loss'])
+        self.embed = d['embed'].copy()
+        self.rms_final = d['rms_final'].copy()
+        if 'initial_loss' in d:
+            self.initial_loss = float(d['initial_loss'])
+        for i in range(self.depth):
+            for k in self.layers[i]:
+                key = f'layer{i}.{k}'
+                if key in d:
+                    self.layers[i][k] = d[key].copy()
+        for name in self._weight_names():
+            mk = f'adam_m.{name}'
+            vk = f'adam_v.{name}'
+            if mk in d: self.adam_m[name] = d[mk].copy()
+            if vk in d: self.adam_v[name] = d[vk].copy()
+        batch_idx = int(d['batch_idx'])
+        total_batches = int(d['total_batches'])
+        all_losses = list(d['all_losses']) if 'all_losses' in d else []
+        return batch_idx, total_batches, all_losses
     
     def _init_weights(self):
         D, H, V = self.dim, self.hidden, self.vocab_size
@@ -411,84 +475,132 @@ def main():
     parser.add_argument('--num-batches', type=int, default=6, help='Number of compile-batches')
     parser.add_argument('--accum-steps', type=int, default=10, help='Gradient accumulation steps per batch')
     parser.add_argument('--data-path', type=str, default=None)
+    parser.add_argument('--resume', action='store_true', help='Resume from checkpoint (used internally by exec restart)')
     args = parser.parse_args()
     
-    print("=" * 60)
-    print("  ANE GPT Training — Apple Neural Engine")
-    print("=" * 60)
-    print(f"  depth={args.depth}, dim={args.dim}, heads={args.heads}")
-    print(f"  seq_len={args.seq_len}, vocab_size={args.vocab_size}")
-    print(f"  lr={args.lr}")
-    print(f"  batches={args.num_batches}, accum_steps={args.accum_steps}")
-    
-    total_steps = args.num_batches * args.accum_steps
-    # Each batch compiles 14 kernels per layer (7 fwd + 7 bwd)
+    # Compile budget: ~90 kernels per exec(), 14 per layer per batch
     compiles_per_batch = args.depth * 14
-    total_compiles = args.num_batches * compiles_per_batch
-    print(f"  total_steps={total_steps}, compiles/batch={compiles_per_batch}")
-    print(f"  total_compiles={total_compiles} (budget: ~100 per exec())")
-    
-    if total_compiles > 90:
-        # Adjust num_batches
-        max_batches = 90 // compiles_per_batch
-        print(f"\n  ⚠ Reducing to {max_batches} batches to stay within compile budget")
-        args.num_batches = max_batches
-        total_steps = max_batches * args.accum_steps
-        total_compiles = max_batches * compiles_per_batch
-        print(f"  adjusted: batches={max_batches}, total_steps={total_steps}, compiles={total_compiles}")
-    
-    print()
-    
+    max_batches_per_exec = max(1, 90 // compiles_per_batch)
+
     trainer = ANEGPTTrainer(
         depth=args.depth, dim=args.dim, heads=args.heads,
         seq_len=args.seq_len, vocab_size=args.vocab_size,
         lr=args.lr, accum_steps=args.accum_steps
     )
-    
+
+    # Resume from checkpoint if restarting
+    start_batch = 0
+    all_losses = []
+    if args.resume and os.path.exists(CKPT_PATH):
+        start_batch, saved_total, saved_losses = trainer.load_checkpoint(CKPT_PATH)
+        all_losses = saved_losses
+        args.num_batches = saved_total
+        print(f"  [RESUMED batch {start_batch}/{args.num_batches}, "
+              f"loss={trainer.last_loss:.4f}, {trainer.cum_steps} steps done]")
+    else:
+        print("=" * 60)
+        print("  ANE GPT Training — Apple Neural Engine")
+        print("=" * 60)
+        print(f"  depth={args.depth}, dim={args.dim}, heads={args.heads}")
+        print(f"  seq_len={args.seq_len}, vocab_size={args.vocab_size}")
+        print(f"  lr={args.lr}")
+        print(f"  batches={args.num_batches}, accum_steps={args.accum_steps}")
+        total_steps = args.num_batches * args.accum_steps
+        total_compiles = args.num_batches * compiles_per_batch
+        print(f"  total_steps={total_steps}, compiles/batch={compiles_per_batch}")
+        print(f"  total_compiles={total_compiles} (budget: ~90 per exec(), will auto-restart)")
+        # Clean up any stale checkpoint
+        if os.path.exists(CKPT_PATH):
+            os.remove(CKPT_PATH)
+
     n_params = sum(w.size for w in [trainer.embed, trainer.rms_final] +
-                   [trainer.layers[i][k] for i in range(args.depth) 
+                   [trainer.layers[i][k] for i in range(args.depth)
                     for k in trainer.layers[i]])
-    print(f"  Parameters: {n_params:,} ({n_params*4/1024/1024:.1f} MB fp32)")
-    
+    if start_batch == 0:
+        print(f"\n  Parameters: {n_params:,} ({n_params*4/1024/1024:.1f} MB fp32)")
+
     if args.data_path and os.path.exists(args.data_path):
-        print(f"  Data: {args.data_path}")
+        if start_batch == 0:
+            print(f"  Data: {args.data_path}")
         data = np.fromfile(args.data_path, dtype=np.uint16)
     else:
-        print("  Data: synthetic random bytes")
-        data = np.random.randint(0, args.vocab_size, size=max(args.seq_len * total_steps * 2, 10000), dtype=np.uint16)
-    
-    print(f"  Data tokens: {len(data):,}")
-    print()
-    
-    all_losses = []
+        if start_batch == 0:
+            print("  Data: synthetic random bytes")
+        total_steps = args.num_batches * args.accum_steps
+        data = np.random.randint(0, args.vocab_size,
+                                 size=max(args.seq_len * total_steps * 2, 10000),
+                                 dtype=np.uint16)
+
+    if start_batch == 0:
+        print(f"  Data tokens: {len(data):,}")
+        print()
+
     t_start = time.time()
-    global_step = 0
-    
-    for batch in range(args.num_batches):
+    global_step = start_batch * args.accum_steps
+    batches_this_exec = 0
+
+    for batch in range(start_batch, args.num_batches):
+        # Check if we need to restart before this batch (fresh ANE compile budget)
+        if batches_this_exec >= max_batches_per_exec:
+            import subprocess
+            wall_this = (time.time() - t_start) * 1000
+            trainer.cum_wall += wall_this
+            trainer.save_checkpoint(CKPT_PATH, batch, args.num_batches, all_losses)
+            print(f"  [restart at batch {batch}, {trainer.bridge.compile_count} compiles]")
+            sys.stdout.flush()
+            # Spawn new process (fresh ANE compile budget) using venv Python
+            nanochat_dir = str(Path(__file__).resolve().parent.parent)
+            venv_python = os.path.join(nanochat_dir, '.venv', 'bin', 'python')
+            if not os.path.exists(venv_python):
+                venv_python = sys.executable
+            cmd = [venv_python, '-m', 'scripts.ane_train',
+                f'--depth={args.depth}', f'--dim={args.dim}', f'--heads={args.heads}',
+                f'--seq-len={args.seq_len}', f'--vocab-size={args.vocab_size}',
+                f'--lr={args.lr}', f'--num-batches={args.num_batches}',
+                f'--accum-steps={args.accum_steps}',
+                '--resume'] + ([f'--data-path={args.data_path}'] if args.data_path else [])
+            result = subprocess.run(cmd, cwd=nanochat_dir)
+            sys.exit(result.returncode)
+
         avg_loss, compile_ms, train_ms, step_losses = trainer.train_batch(data, global_step)
         all_losses.extend(step_losses)
         global_step += args.accum_steps
-        
+        batches_this_exec += 1
+
+        trainer.cum_steps = global_step
+        trainer.cum_compile_ms += compile_ms
+        trainer.cum_train_ms += train_ms
+        trainer.last_loss = avg_loss
+        if trainer.initial_loss is None:
+            trainer.initial_loss = step_losses[0]
+
         ms_per_step = train_ms / args.accum_steps
-        elapsed = time.time() - t_start
-        tok_per_sec = global_step * args.seq_len / elapsed
-        
+        total_elapsed = trainer.cum_wall / 1000 + (time.time() - t_start)
+        tok_per_sec = global_step * args.seq_len / total_elapsed if total_elapsed > 0 else 0
+
         print(f"  batch {batch:3d}  steps={global_step:4d}  loss={avg_loss:.4f}  "
               f"compile={compile_ms:.0f}ms  {ms_per_step:.1f}ms/step  "
               f"{tok_per_sec:.0f} tok/s  compiles={trainer.bridge.compile_count}")
-    
-    elapsed = time.time() - t_start
+
+    # Final stats
+    wall_this = (time.time() - t_start) * 1000
+    total_wall = (trainer.cum_wall + wall_this) / 1000
     print()
     print("=" * 60)
     print("  Training Complete")
     print("=" * 60)
     print(f"  Total steps:  {len(all_losses)}")
-    print(f"  Initial loss: {all_losses[0]:.4f}")
-    print(f"  Final loss:   {all_losses[-1]:.4f}")
-    print(f"  Wall time:    {elapsed:.1f}s")
-    print(f"  Avg ms/step:  {elapsed*1000/len(all_losses):.0f}")
-    print(f"  Compiles:     {trainer.bridge.compile_count}")
+    print(f"  Initial loss: {all_losses[0]:.4f}" if all_losses else "  Initial loss: N/A")
+    print(f"  Final loss:   {all_losses[-1]:.4f}" if all_losses else "  Final loss: N/A")
+    print(f"  Wall time:    {total_wall:.1f}s")
+    if all_losses:
+        print(f"  Avg ms/step:  {total_wall*1000/len(all_losses):.0f}")
+    print(f"  Compile time: {trainer.cum_compile_ms:.0f}ms")
     print("=" * 60)
+
+    # Clean up checkpoint
+    if os.path.exists(CKPT_PATH):
+        os.remove(CKPT_PATH)
 
 
 if __name__ == "__main__":

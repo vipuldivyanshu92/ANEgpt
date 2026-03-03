@@ -667,7 +667,7 @@ int main(int argc, char *argv[]) {
         // In train_large_ane: classifier fwd + softmax run on ANE (not CPU)
         double ane_flops = (fwd_flops*2 + sdpa_flops + cls_flops) * total_steps_done;
 
-        printf("\n=== Efficiency Report ===\n");
+        printf("\n=== NEW Efficiency Report ===\n");
         printf("Total steps:     %d\n", total_steps_done);
         printf("Wall time:       %.0f ms (%.1f s)\n", wall, wall/1000);
         printf("Compile time:    %.0f ms (%.1f%%)\n", total_compile_ms, 100*total_compile_ms/wall);

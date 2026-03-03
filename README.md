@@ -71,7 +71,7 @@ CPU handles: dW gradient accumulation (cblas_sgemm, runs async in parallel with 
 
 ### `ane-training/` — ANE Runtime & Kernels (Obj-C)
 
-The low-level engine. Reverse-engineers private `AppleNeuralEngine.framework` APIs to compile and run MIL programs on ANE. Modified after forking from [maderix/ane-training](https://github.com/maderix/ANE).
+The low-level engine. Reverse-engineers private `AppleNeuralEngine.framework` APIs to compile and run MIL programs on ANE. Modified after forking from [maderix/ane](https://github.com/maderix/ANE).
 
 - **`training/train_large.m`** — Baseline training: 12-layer Stories110M, forward/backward, checkpoint, exec() restart
 - **`training/train_large_ane.m`** — ANE-offloaded variant: moves classifier, softmax, RMSNorm backward to ANE
@@ -333,7 +333,7 @@ The key difference: `train_large_ane` moves classifier forward (10×), softmax (
 
 This project builds on the following work:
 
-- **[maderix/ane-training](https://github.com/maderix/ane-training)** — The original reverse-engineering of ANE private APIs for neural network training. The `ane-training/` directory is based on this work.
+- **[maderix/ane](https://github.com/maderix/ane)** — The original reverse-engineering of ANE private APIs for neural network training. The `ane-training/` directory is based on this work.
 - **[Andrej Karpathy / nanochat](https://github.com/karpathy/nanochat)** — The simplest full-stack LLM training harness. The `nanochat/` directory is a fork extended with ANE training support.
 - **[KellerJordan/modded-nanogpt](https://github.com/KellerJordan/modded-nanogpt)** — Gamified nanoGPT with leaderboards, which inspired nanochat's speedrun approach.
 
@@ -352,20 +352,6 @@ This project is licensed under the **MIT License** — see the [LICENSE](LICENSE
 The included components also carry MIT licenses:
 - `ane-training/` — MIT © 2026 maderix
 - `nanochat/` — MIT © 2025 Andrej Karpathy
-
----
-
-## Cite
-
-```bibtex
-@misc{anegpt,
-  author = {Vipul Divyanshu},
-  title = {ANEgpt: Training GPT Models on Apple Neural Engine},
-  year = {2026},
-  publisher = {GitHub},
-  url = {https://github.com/vipuldivyanshu/ANEgpt}
-}
-```
 
 ---
 
