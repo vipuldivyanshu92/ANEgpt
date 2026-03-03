@@ -219,16 +219,14 @@ class ANEGPTTrainer:
         kernel = self.bridge.compile(mil, w_blob, [in_bytes], [out_bytes])
         return CachedKernel(kernel, (out_ch, S))
     
-    def _compile_all_kernels(self):
-        """Compile all forward and backward kernels for current weights."""
+    def _compile_fwd_kernels(self):
+        """Compile only forward kernels for current weights."""
         D, H, S = self.dim, self.hidden, self.seq_len
-        kernels = {'fwd': [], 'bwd': []}
+        fwd_layers = []
         
         for i in range(self.depth):
             layer = self.layers[i]
             lk = {}
-            
-            # Forward kernels
             lk['Wq_fwd'] = self._compile_kernel(layer['Wq'], D, D, S)
             lk['Wk_fwd'] = self._compile_kernel(layer['Wk'], D, D, S)
             lk['Wv_fwd'] = self._compile_kernel(layer['Wv'], D, D, S)
@@ -236,8 +234,18 @@ class ANEGPTTrainer:
             lk['W1_fwd'] = self._compile_kernel(layer['W1'], D, H, S)
             lk['W2_fwd'] = self._compile_kernel(layer['W2'], H, D, S)
             lk['W3_fwd'] = self._compile_kernel(layer['W3'], D, H, S)
-            
-            # Backward kernels (transpose weights)
+            fwd_layers.append(lk)
+        
+        return fwd_layers
+    
+    def _compile_bwd_kernels(self):
+        """Compile only backward kernels (transposed weights) for current weights."""
+        D, H, S = self.dim, self.hidden, self.seq_len
+        bwd_layers = []
+        
+        for i in range(self.depth):
+            layer = self.layers[i]
+            lk = {}
             lk['Wo_bwd'] = self._compile_kernel(layer['Wo'].T.copy(), D, D, S)
             lk['Wq_bwd'] = self._compile_kernel(layer['Wq'].T.copy(), D, D, S)
             lk['Wk_bwd'] = self._compile_kernel(layer['Wk'].T.copy(), D, D, S)
@@ -245,16 +253,14 @@ class ANEGPTTrainer:
             lk['W1_bwd'] = self._compile_kernel(layer['W1'].T.copy(), H, D, S)
             lk['W2_bwd'] = self._compile_kernel(layer['W2'].T.copy(), D, H, S)
             lk['W3_bwd'] = self._compile_kernel(layer['W3'].T.copy(), H, D, S)
-            
-            kernels['fwd'].append(lk)
-            kernels['bwd'].append(lk)  # Same dict, backward keys
+            bwd_layers.append(lk)
         
-        return kernels
+        return bwd_layers
     
-    def _free_kernels(self, kernels):
-        """Free all compiled kernels."""
-        for layer_kernels in kernels['fwd']:
-            for k in layer_kernels.values():
+    def _free_layer_kernels(self, layer_list):
+        """Free kernels from a list of per-layer kernel dicts."""
+        for lk in layer_list:
+            for k in lk.values():
                 k.free()
     
     def _forward_attention(self, x, layer, lk):
@@ -348,16 +354,15 @@ class ANEGPTTrainer:
         
         return dx, {'Wq': dWq, 'Wk': dWk, 'Wv': dWv, 'Wo': dWo, 'rms_att': drms_att}
     
-    def train_step_cached(self, tokens, kernels):
-        """Single forward+backward pass using pre-compiled kernels."""
+    def _forward_pass(self, tokens, fwd_kernels):
+        """Run forward pass, return loss and saved state for backward."""
         D, S, V = self.dim, self.seq_len, self.vocab_size
         x = self.embed[tokens[:S]].T.copy().astype(np.float32)
         target = tokens[1:S+1]
         
-        # Forward
         attn_caches, ffn_caches = [], []
         for i in range(self.depth):
-            lk = kernels['fwd'][i]
+            lk = fwd_kernels[i]
             x, ac = self._forward_attention(x, self.layers[i], lk)
             attn_caches.append(ac)
             x, fc = self._forward_ffn(x, self.layers[i], lk)
@@ -367,6 +372,22 @@ class ANEGPTTrainer:
         logits = self.embed @ x_final
         loss, dlogits = cross_entropy_loss(logits, target)
         
+        saved = {
+            'tokens': tokens, 'x_pre_final': x, 'x_final': x_final,
+            'dlogits': dlogits, 'attn_caches': attn_caches, 'ffn_caches': ffn_caches,
+        }
+        return loss, saved
+    
+    def _backward_pass(self, saved, bwd_kernels):
+        """Run backward pass using saved forward state."""
+        tokens = saved['tokens']
+        S = self.seq_len
+        x = saved['x_pre_final']
+        x_final = saved['x_final']
+        dlogits = saved['dlogits']
+        attn_caches = saved['attn_caches']
+        ffn_caches = saved['ffn_caches']
+        
         # Backward through classifier
         dx_final = self.embed.T @ dlogits
         dembed = dlogits @ x_final.T
@@ -375,7 +396,7 @@ class ANEGPTTrainer:
         # Backward through layers
         layer_grads = [{} for _ in range(self.depth)]
         for i in range(self.depth - 1, -1, -1):
-            lk = kernels['fwd'][i]  # same dict has bwd keys
+            lk = bwd_kernels[i]
             dx, fg = self._backward_ffn(dx, self.layers[i], lk, ffn_caches[i])
             dx, ag = self._backward_attention(dx, self.layers[i], lk, attn_caches[i])
             layer_grads[i].update(fg)
@@ -386,42 +407,63 @@ class ANEGPTTrainer:
         for t in range(S_len):
             dembed[tokens[t]] += dx[:, t]
         
-        return loss, dembed, drms_final, layer_grads
+        return dembed, drms_final, layer_grads
     
     def train_batch(self, data, step_offset):
         """
         Train one batch with gradient accumulation.
-        Compiles kernels once, runs accum_steps forward/backward passes,
-        accumulates gradients, then updates weights.
+        
+        Split into two phases to halve peak ANE program loads:
+        Phase 1: Compile forward kernels, run all accum_steps forward, free fwd kernels
+        Phase 2: Compile backward kernels, run all accum_steps backward, free bwd kernels
         """
         S = self.seq_len
         max_pos = len(data) - S - 1
         
-        # Compile all kernels with current weights
+        # --- Phase 1: Forward pass (compile fwd kernels only) ---
         t_compile = time.time()
-        kernels = self._compile_all_kernels()
+        try:
+            fwd_kernels = self._compile_fwd_kernels()
+        except RuntimeError as e:
+            if 'ANE compile failed' in str(e):
+                return None, 0, 0, []  # Signal caller to restart
+            raise
+        
+        # Run forward for all accum_steps, saving state for backward
+        total_loss = 0.0
+        step_losses = []
+        all_saved = []
+        
+        t_train = time.time()
+        for s in range(self.accum_steps):
+            pos = np.random.randint(0, max_pos)
+            tokens = data[pos:pos + S + 1].astype(np.int64)
+            loss, saved = self._forward_pass(tokens, fwd_kernels)
+            total_loss += loss
+            step_losses.append(loss)
+            all_saved.append(saved)
+        
+        # Free forward kernels before compiling backward
+        self._free_layer_kernels(fwd_kernels)
+        
+        # --- Phase 2: Backward pass (compile bwd kernels only) ---
+        try:
+            bwd_kernels = self._compile_bwd_kernels()
+        except RuntimeError as e:
+            if 'ANE compile failed' in str(e):
+                return None, 0, 0, []  # Signal caller to restart
+            raise
         compile_ms = (time.time() - t_compile) * 1000
         
-        # Accumulate gradients
+        # Accumulate gradients from backward passes
         acc_dembed = np.zeros_like(self.embed)
         acc_drms_final = np.zeros_like(self.rms_final)
         acc_layer_grads = [{k: np.zeros_like(v) for k, v in self.layers[i].items() 
                            if k.startswith(('W', 'rms'))}
                           for i in range(self.depth)]
         
-        total_loss = 0.0
-        step_losses = []
-        
-        t_train = time.time()
         for s in range(self.accum_steps):
-            pos = np.random.randint(0, max_pos)
-            tokens = data[pos:pos + S + 1].astype(np.int64)
-            
-            loss, dembed, drms_final, layer_grads = self.train_step_cached(tokens, kernels)
-            total_loss += loss
-            step_losses.append(loss)
-            
-            # Accumulate
+            dembed, drms_final, layer_grads = self._backward_pass(all_saved[s], bwd_kernels)
             acc_dembed += dembed
             acc_drms_final += drms_final
             for i in range(self.depth):
@@ -430,8 +472,9 @@ class ANEGPTTrainer:
         
         train_ms = (time.time() - t_train) * 1000
         
-        # Free kernels
-        self._free_kernels(kernels)
+        # Free backward kernels
+        self._free_layer_kernels(bwd_kernels)
+        del all_saved  # Free cached forward state
         
         # Average gradients
         n = self.accum_steps
@@ -476,11 +519,14 @@ def main():
     parser.add_argument('--accum-steps', type=int, default=10, help='Gradient accumulation steps per batch')
     parser.add_argument('--data-path', type=str, default=None)
     parser.add_argument('--resume', action='store_true', help='Resume from checkpoint (used internally by exec restart)')
+    parser.add_argument('--ane-retries', type=int, default=0, help='ANE restart retry counter (internal)')
     args = parser.parse_args()
     
-    # Compile budget: ~90 kernels per exec(), 14 per layer per batch
+    # Compile budget: we now properly free ANE kernels, so lifetime limit is high.
+    # We still restart the process occasionally (e.g. every ~500 compiles) to be
+    # completely safe against any other memory leaks, but it's no longer a hard bottleneck.
     compiles_per_batch = args.depth * 14
-    max_batches_per_exec = max(1, 90 // compiles_per_batch)
+    max_batches_per_exec = max(1, 500 // compiles_per_batch)
 
     trainer = ANEGPTTrainer(
         depth=args.depth, dim=args.dim, heads=args.heads,
@@ -508,7 +554,7 @@ def main():
         total_steps = args.num_batches * args.accum_steps
         total_compiles = args.num_batches * compiles_per_batch
         print(f"  total_steps={total_steps}, compiles/batch={compiles_per_batch}")
-        print(f"  total_compiles={total_compiles} (budget: ~90 per exec(), will auto-restart)")
+        print(f"  total_compiles={total_compiles} (budget: ~55 per exec(), will auto-restart)")
         # Clean up any stale checkpoint
         if os.path.exists(CKPT_PATH):
             os.remove(CKPT_PATH)
@@ -548,6 +594,7 @@ def main():
             trainer.save_checkpoint(CKPT_PATH, batch, args.num_batches, all_losses)
             print(f"  [restart at batch {batch}, {trainer.bridge.compile_count} compiles]")
             sys.stdout.flush()
+            time.sleep(3)  # Cooldown: let ANE daemon reclaim system-wide program slots
             # Spawn new process (fresh ANE compile budget) using venv Python
             nanochat_dir = str(Path(__file__).resolve().parent.parent)
             venv_python = os.path.join(nanochat_dir, '.venv', 'bin', 'python')
@@ -558,11 +605,43 @@ def main():
                 f'--seq-len={args.seq_len}', f'--vocab-size={args.vocab_size}',
                 f'--lr={args.lr}', f'--num-batches={args.num_batches}',
                 f'--accum-steps={args.accum_steps}',
-                '--resume'] + ([f'--data-path={args.data_path}'] if args.data_path else [])
+                '--resume', '--ane-retries=0'] + ([f'--data-path={args.data_path}'] if args.data_path else [])
             result = subprocess.run(cmd, cwd=nanochat_dir)
             sys.exit(result.returncode)
 
-        avg_loss, compile_ms, train_ms, step_losses = trainer.train_batch(data, global_step)
+        result = trainer.train_batch(data, global_step)
+        avg_loss, compile_ms, train_ms, step_losses = result
+
+        # ANE compile failed — force restart into a fresh process
+        if avg_loss is None:
+            max_ane_retries = 5
+            if args.ane_retries >= max_ane_retries:
+                print(f"  [FATAL: ANE load failed {max_ane_retries} times in a row, giving up]")
+                print(f"  The ANE program slot pool is exhausted system-wide.")
+                print(f"  Wait a few minutes and try again, or reduce --depth.")
+                sys.exit(1)
+            import subprocess
+            wall_this = (time.time() - t_start) * 1000
+            trainer.cum_wall += wall_this
+            trainer.save_checkpoint(CKPT_PATH, batch, args.num_batches, all_losses)
+            retry_num = args.ane_retries + 1
+            cooldown = min(3 * retry_num, 15)  # Escalating cooldown: 3s, 6s, 9s, 12s, 15s
+            print(f"  [ANE load failed at batch {batch}, retry {retry_num}/{max_ane_retries}, cooldown {cooldown}s]")
+            sys.stdout.flush()
+            time.sleep(cooldown)
+            nanochat_dir = str(Path(__file__).resolve().parent.parent)
+            venv_python = os.path.join(nanochat_dir, '.venv', 'bin', 'python')
+            if not os.path.exists(venv_python):
+                venv_python = sys.executable
+            cmd = [venv_python, '-m', 'scripts.ane_train',
+                f'--depth={args.depth}', f'--dim={args.dim}', f'--heads={args.heads}',
+                f'--seq-len={args.seq_len}', f'--vocab-size={args.vocab_size}',
+                f'--lr={args.lr}', f'--num-batches={args.num_batches}',
+                f'--accum-steps={args.accum_steps}',
+                f'--resume', f'--ane-retries={retry_num}'] + ([f'--data-path={args.data_path}'] if args.data_path else [])
+            r = subprocess.run(cmd, cwd=nanochat_dir)
+            sys.exit(r.returncode)
+
         all_losses.extend(step_losses)
         global_step += args.accum_steps
         batches_this_exec += 1

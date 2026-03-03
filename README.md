@@ -17,7 +17,7 @@ Apple does not expose any public API for training on the ANE. This project rever
 - Passes tensors via IOSurface shared memory in `[1, C, 1, S]` fp16 format
 - Runs forward and backward dx passes on ANE; weight gradients (dW) on CPU via Accelerate cblas
 - Includes Adam optimizer, gradient accumulation, and checkpoint/resume
-- Works around the ~119 ANE compile limit per process via `exec()` restart
+- Stably manages ANE program memory by explicitly releasing Objective-C objects under ARC, enabling sustained training without compiler memory exhaustion
 
 ### What You Can Train
 
@@ -156,6 +156,8 @@ The code measures and prints performance metrics at runtime (ms/step, TFLOPS, AN
 - **GCD async cblas overlap** — dW gradient sgemms run in parallel with ANE evals on a background dispatch queue
 - **Deferred cblas wait** — wait pushed into next step's forward pass for overlap
 - **Forward taps** — Q, K, V, attention scores exposed via concat outputs, avoiding CPU recompute
+- **Split Kernel Lifecycle** — Forward and backward kernels are compiled and freed in separate phases, halving the peak number of concurrently loaded ANE programs
+- **Strict ARC Memory Management** — ANE objects are explicitly nilled before struct deallocation in the C bridge to gracefully release system-wide resources and prevent `0x50004` load failures
 
 ---
 
@@ -243,6 +245,15 @@ bash runs/runane.sh
 
 This will set up the virtual environment, build the ANE bridge, and train a tiny model on synthetic data. See `runs/runane.sh` for details.
 
+**Example Benchmark (Python wrapper)**:
+```text
+  Total steps:  200
+  Wall time:    21.2s
+  Avg ms/step:  106 ms
+  Compile time: 14095 ms
+```
+*(Tested on an M-series chip with no process restarts via the stable ARC integration)*
+
 ### Step 4: Monitor with Dashboard
 
 The TUI dashboard shows real-time loss curves, power/CPU/memory graphs, and text generation:
@@ -307,7 +318,6 @@ The key difference: `train_large_ane` moves classifier forward (10×), softmax (
 
 ## Known Limitations
 
-- **~119 compile limit** — ANE compiler leaks resources per process; worked around via `exec()` restart with checkpoint save/restore
 - **Weights baked at compile time** — every weight update requires recompilation of all kernels (verified on M5, see `m5result.md`)
 - **SDPA causal masking** — ANE hardware ignores `attn_mask` in SDPA ops; causal attention is decomposed into separate Q@Kᵀ (ANE) → mask+softmax → scores@V (ANE)
 - **macOS only** — requires Apple Silicon and private framework APIs

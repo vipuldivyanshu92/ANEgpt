@@ -137,10 +137,19 @@ ANEKernelHandle *ane_bridge_compile_multi_weights(
             return NULL;
         }
 
-        // Load
-        if (!((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
-                mdl, @selector(loadWithQoS:options:error:), 21, @{}, &e)) {
-            fprintf(stderr, "ane_bridge: ANE load failed: %s\n",
+        // Load (with one retry after a brief pause for ANE slot reclamation)
+        BOOL loaded = ((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
+                mdl, @selector(loadWithQoS:options:error:), 21, @{}, &e);
+        if (!loaded) {
+            fprintf(stderr, "ane_bridge: ANE load failed (retrying in 100ms): %s\n",
+                    e ? [[e description] UTF8String] : "unknown");
+            usleep(100000); // 100ms
+            e = nil;
+            loaded = ((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
+                    mdl, @selector(loadWithQoS:options:error:), 21, @{}, &e);
+        }
+        if (!loaded) {
+            fprintf(stderr, "ane_bridge: ANE load failed after retry: %s\n",
                     e ? [[e description] UTF8String] : "unknown");
             [fm removeItemAtPath:td error:nil];
             return NULL;
@@ -256,6 +265,12 @@ void ane_bridge_free(ANEKernelHandle *kernel) {
         free(kernel->ioOutputs);
         free(kernel->inputBytes);
         free(kernel->outputBytes);
+        
+        // Explicitly nil Objective-C objects to trigger ARC release before freeing struct
+        kernel->model = nil;
+        kernel->request = nil;
+        kernel->tmpDir = nil;
+        
         free(kernel);
     }
 }
